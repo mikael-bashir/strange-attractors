@@ -68,27 +68,91 @@ LYAP_RENORM_INTERVAL = 10  # Renormalize every N steps to prevent overflow
 LYAP_TRACK_PARTICLES = 100  # Number of particles to track for lyap computation
 LYAP_SAVE_INTERVAL = 100   # Save lyap values every N steps
 
+# Noise distribution types and generators
+class NoiseType:
+    UNIFORM = "uniform"
+    GAUSSIAN = "gaussian"
+    NONE = "none"
+
+def generate_noise(size, noise_config):
+    """
+    Generate noise based on configuration.
+    noise_config = {
+        'type': NoiseType.UNIFORM | NoiseType.GAUSSIAN | NoiseType.NONE,
+        'params': {
+            # for uniform:
+            'low': float,  # lower bound
+            'high': float, # upper bound
+            # for gaussian:
+            'mean': float,
+            'std': float,
+        }
+    }
+    """
+    if noise_config['type'] == NoiseType.NONE:
+        return np.zeros(size, dtype=np.float32)
+    elif noise_config['type'] == NoiseType.UNIFORM:
+        return np.random.uniform(
+            noise_config['params']['low'],
+            noise_config['params']['high'],
+            size=size
+        ).astype(np.float32)
+    elif noise_config['type'] == NoiseType.GAUSSIAN:
+        return np.random.normal(
+            noise_config['params']['mean'],
+            noise_config['params']['std'],
+            size=size
+        ).astype(np.float32)
+    else:
+        raise ValueError(f"Unknown noise type: {noise_config['type']}")
+
 # --- Attractor Configurations ---
 ATTRACTORS = {
     1: {
         'name': 'Hénon',
         'params': {'a': 1.4, 'b': 0.3},
-        'noise_range': 0.005,
+        # 'noise': {
+        #     'type': NoiseType.GAUSSIAN,
+        #     'params': {
+        #         'mean': 0.5,
+        #         'std': 0.005
+        #     }
+        # },
+
+        'noise': {
+            'type': NoiseType.UNIFORM,
+            'params': {
+                'low': -0.001,
+                'high': 0.001
+            }
+        },
         'bounds': {'x': (-2.0, 2.0), 'y': (-0.6, 0.6)},
         'init_bounds': {'x': (-1.0, 1.0), 'y': (-0.5, 0.5)}
     },
     2: {
         'name': 'Clifford',
         'params': {'a': -1.7, 'b': 1.8, 'c': -0.9, 'd': -0.4},
-        'noise_range': 0.15,
+        'noise': {
+            'type': NoiseType.UNIFORM,
+            'params': {
+                'low': -0.15,
+                'high': 0.15
+            }
+        },
         'bounds': {'x': (-2.5, 2.5), 'y': (-2.5, 2.5)},
         'init_bounds': {'x': (-1.5, 1.5), 'y': (-1.5, 1.5)}
     },
     3: {
         'name': 'Ikeda',
-        'params': {'u': 0.90},   # More stable base u
-        'noise_range': 0.01,    # Smaller noise range initially
-        'bounds': {'x': (0.0, 2.0), 'y': (-2.0, 2.0)}, # Start with a smaller view window
+        'params': {'u': 0.90},
+        'noise': {
+            'type': NoiseType.GAUSSIAN,
+            'params': {
+                'mean': 0.0,
+                'std': 0.01
+            }
+        },
+        'bounds': {'x': (0.0, 2.0), 'y': (-2.0, 2.0)},
         'init_bounds': {'x': (0.1, 0.5), 'y': (-0.5, 0.5)}
     }
 }
@@ -117,7 +181,16 @@ print(f"\nSelected: {config['name']} Attractor")
 # --- Parameters ---
 ATTRACTOR_NAME = config['name']
 BASE_PARAMS = config['params']
-NOISE_RANGE = config['noise_range']
+
+# Compute effective noise range based on noise type
+if config['noise']['type'] == NoiseType.GAUSSIAN:
+    NOISE_RANGE = config['noise']['params']['std']
+elif config['noise']['type'] == NoiseType.UNIFORM:
+    # For uniform distribution, range is (high - low)/2
+    NOISE_RANGE = (config['noise']['params']['high'] - config['noise']['params']['low']) / 2
+else:
+    NOISE_RANGE = 0.0
+
 X_MIN, X_MAX = config['bounds']['x']
 Y_MIN, Y_MAX = config['bounds']['y']
 INIT_X_MIN, INIT_X_MAX = config['init_bounds']['x']
@@ -146,8 +219,7 @@ TOTAL_NOISE_LENGTH = PULLBACK_STEPS + (NUM_SNAPSHOTS * STEPS_PER_SNAPSHOT) + 100
 print(f"Generating {TOTAL_NOISE_LENGTH} noise values for {len(param_names)} parameters...")
 noise_dict = {}
 for param in param_names:
-    noise_dict[param] = np.random.uniform(-NOISE_RANGE, NOISE_RANGE, 
-                                         size=TOTAL_NOISE_LENGTH).astype(np.float32)
+    noise_dict[param] = generate_noise(TOTAL_NOISE_LENGTH, config['noise'])
 
 # Output
 RESULTS_BASE_DIR = "results"
@@ -187,7 +259,7 @@ if BACKEND == 'cuda':
     def evolve_henon_with_lyap_kernel(particles_x, particles_y, 
                                      tangent_xx, tangent_xy, tangent_yx, tangent_yy,
                                      noise_a, noise_b, num_steps, base_a, base_b,
-                                     lyap_sums, step_count):
+                                     lyap_sums1, lyap_sums2, step_count):
         """Evolve henon with lyapunov exponent computation"""
         thread_id = cuda.grid(1)
         if thread_id >= particles_x.shape[0]:
@@ -199,16 +271,33 @@ if BACKEND == 'cuda':
         txx, txy = tangent_xx[thread_id], tangent_xy[thread_id] 
         tyx, tyy = tangent_yx[thread_id], tangent_yy[thread_id]
         
-        local_lyap_sum = 0.0
+        local_lyap_sum1 = 0.0  # for first exponent
+        local_lyap_sum2 = 0.0  # for second exponent
         local_step_count = 0
         
         for step in range(num_steps):
+            # Check for divergence
+            if not (math.isfinite(x) and math.isfinite(y)):
+                x = 0.0  # Reset to origin
+                y = 0.0
+                txx, txy = 1.0, 0.0  # Reset tangent space
+                tyx, tyy = 0.0, 1.0
+                continue
+            
             a = base_a + noise_a[step]
             b = base_b + noise_b[step]
             
             # Evolve main trajectory
             x_new = 1.0 - a * x * x + y
             y_new = b * x
+            
+            # Check for overflow in evolution
+            if not (math.isfinite(x_new) and math.isfinite(y_new)):
+                x = 0.0
+                y = 0.0
+                txx, txy = 1.0, 0.0
+                tyx, tyy = 0.0, 1.0
+                continue
             
             # Compute jacobian at current point
             # J = [[-2*a*x, 1], [b, 0]]
@@ -221,14 +310,24 @@ if BACKEND == 'cuda':
             tyx_new = j21 * txx + j22 * tyx  
             tyy_new = j21 * txy + j22 * tyy
             
+            # Check for overflow in tangent space - explicit checks instead of generator
+            if not math.isfinite(txx_new) or not math.isfinite(txy_new) or not math.isfinite(tyx_new) or not math.isfinite(tyy_new):
+                txx, txy = 1.0, 0.0
+                tyx, tyy = 0.0, 1.0
+                x, y = x_new, y_new  # Keep orbit evolution
+                continue
+            
             # Gram-Schmidt orthonormalization every LYAP_RENORM_INTERVAL steps
             if (step + 1) % LYAP_RENORM_INTERVAL == 0:
-                # First vector norm
+                # First vector norm (largest exponent)
                 norm1 = math.sqrt(txx_new * txx_new + tyx_new * tyx_new)
-                if norm1 > 1e-12:
+                if norm1 > 1e-12:  # Avoid division by zero
                     txx_new /= norm1
                     tyx_new /= norm1
-                    local_lyap_sum += math.log(norm1)
+                    if math.isfinite(math.log(norm1)):
+                        local_lyap_sum1 += math.log(norm1)
+                else:
+                    txx_new, tyx_new = 1.0, 0.0  # Reset if too small
                 
                 # Second vector: subtract projection, then normalize
                 dot_product = txy_new * txx_new + tyy_new * tyx_new
@@ -236,10 +335,13 @@ if BACKEND == 'cuda':
                 tyy_new -= dot_product * tyx_new
                 
                 norm2 = math.sqrt(txy_new * txy_new + tyy_new * tyy_new)
-                if norm2 > 1e-12:
+                if norm2 > 1e-12:  # Avoid division by zero
                     txy_new /= norm2
                     tyy_new /= norm2
-                    local_lyap_sum += math.log(norm2)
+                    if math.isfinite(math.log(norm2)):
+                        local_lyap_sum2 += math.log(norm2)
+                else:
+                    txy_new, tyy_new = 0.0, 1.0  # Reset if too small
                 
                 local_step_count += 1
             
@@ -255,7 +357,8 @@ if BACKEND == 'cuda':
         tangent_xy[thread_id] = txy
         tangent_yx[thread_id] = tyx
         tangent_yy[thread_id] = tyy
-        lyap_sums[thread_id] += local_lyap_sum
+        lyap_sums1[thread_id] += local_lyap_sum1
+        lyap_sums2[thread_id] += local_lyap_sum2
         step_count[thread_id] += local_step_count
 
     @cuda.jit
@@ -263,7 +366,7 @@ if BACKEND == 'cuda':
                                         tangent_xx, tangent_xy, tangent_yx, tangent_yy,
                                         noise_a, noise_b, noise_c, noise_d, 
                                         num_steps, base_a, base_b, base_c, base_d,
-                                        lyap_sums, step_count):
+                                        lyap_sums1, lyap_sums2, step_count):
         """Evolve clifford with lyapunov exponent computation"""
         thread_id = cuda.grid(1)
         if thread_id >= particles_x.shape[0]:
@@ -275,10 +378,19 @@ if BACKEND == 'cuda':
         txx, txy = tangent_xx[thread_id], tangent_xy[thread_id] 
         tyx, tyy = tangent_yx[thread_id], tangent_yy[thread_id]
         
-        local_lyap_sum = 0.0
+        local_lyap_sum1 = 0.0  # for first exponent
+        local_lyap_sum2 = 0.0  # for second exponent
         local_step_count = 0
         
         for step in range(num_steps):
+            # Check for divergence
+            if not (math.isfinite(x) and math.isfinite(y)):
+                x = 0.0  # Reset to origin
+                y = 0.0
+                txx, txy = 1.0, 0.0  # Reset tangent space
+                tyx, tyy = 0.0, 1.0
+                continue
+            
             a = base_a + noise_a[step]
             b = base_b + noise_b[step]
             c = base_c + noise_c[step]
@@ -287,6 +399,14 @@ if BACKEND == 'cuda':
             # Evolve main trajectory
             x_new = math.sin(a * y) + c * math.cos(a * x)
             y_new = math.sin(b * x) + d * math.cos(b * y)
+            
+            # Check for overflow in evolution
+            if not (math.isfinite(x_new) and math.isfinite(y_new)):
+                x = 0.0
+                y = 0.0
+                txx, txy = 1.0, 0.0
+                tyx, tyy = 0.0, 1.0
+                continue
             
             # Compute jacobian at current point
             # J = [[-c*a*sin(a*x), a*cos(a*y)], [b*cos(b*x), -d*b*sin(b*y)]]
@@ -301,14 +421,24 @@ if BACKEND == 'cuda':
             tyx_new = j21 * txx + j22 * tyx  
             tyy_new = j21 * txy + j22 * tyy
             
+            # Check for overflow in tangent space - explicit checks
+            if not math.isfinite(txx_new) or not math.isfinite(txy_new) or not math.isfinite(tyx_new) or not math.isfinite(tyy_new):
+                txx, txy = 1.0, 0.0
+                tyx, tyy = 0.0, 1.0
+                x, y = x_new, y_new  # Keep orbit evolution
+                continue
+            
             # Gram-Schmidt orthonormalization every LYAP_RENORM_INTERVAL steps
             if (step + 1) % LYAP_RENORM_INTERVAL == 0:
-                # First vector norm
+                # First vector norm (largest exponent)
                 norm1 = math.sqrt(txx_new * txx_new + tyx_new * tyx_new)
-                if norm1 > 1e-12:
+                if norm1 > 1e-12:  # Avoid division by zero
                     txx_new /= norm1
                     tyx_new /= norm1
-                    local_lyap_sum += math.log(norm1)
+                    if math.isfinite(math.log(norm1)):
+                        local_lyap_sum1 += math.log(norm1)
+                else:
+                    txx_new, tyx_new = 1.0, 0.0  # Reset if too small
                 
                 # Second vector: subtract projection, then normalize
                 dot_product = txy_new * txx_new + tyy_new * tyx_new
@@ -316,10 +446,13 @@ if BACKEND == 'cuda':
                 tyy_new -= dot_product * tyx_new
                 
                 norm2 = math.sqrt(txy_new * txy_new + tyy_new * tyy_new)
-                if norm2 > 1e-12:
+                if norm2 > 1e-12:  # Avoid division by zero
                     txy_new /= norm2
                     tyy_new /= norm2
-                    local_lyap_sum += math.log(norm2)
+                    if math.isfinite(math.log(norm2)):
+                        local_lyap_sum2 += math.log(norm2)
+                else:
+                    txy_new, tyy_new = 0.0, 1.0  # Reset if too small
                 
                 local_step_count += 1
             
@@ -335,7 +468,8 @@ if BACKEND == 'cuda':
         tangent_xy[thread_id] = txy
         tangent_yx[thread_id] = tyx
         tangent_yy[thread_id] = tyy
-        lyap_sums[thread_id] += local_lyap_sum
+        lyap_sums1[thread_id] += local_lyap_sum1
+        lyap_sums2[thread_id] += local_lyap_sum2
         step_count[thread_id] += local_step_count
 
     @cuda.jit  
@@ -506,10 +640,57 @@ class LyapunovTracker:
             self.tangent_yx = cp.zeros(num_particles, dtype=cp.float32)
             self.tangent_yy = cp.ones(num_particles, dtype=cp.float32)
             
-            # Running sums for lyapunov computation
-            self.lyap_sums = cp.zeros(num_particles, dtype=cp.float32)
+            # Running sums for both lyapunov exponents
+            self.lyap_sums1 = cp.zeros(num_particles, dtype=cp.float32)  # first exponent
+            self.lyap_sums2 = cp.zeros(num_particles, dtype=cp.float32)  # second exponent
             self.step_count = cp.zeros(num_particles, dtype=cp.int32)
     
+    def get_current_exponents(self):
+        """Get current lyapunov spectrum"""
+        if self.backend == 'cuda':
+            sums1_cpu = cp.asnumpy(self.lyap_sums1)
+            sums2_cpu = cp.asnumpy(self.lyap_sums2)
+            counts_cpu = cp.asnumpy(self.step_count)
+            
+            valid_mask = counts_cpu > 0
+            if np.any(valid_mask):
+                # Individual particle lyapunov spectrums
+                lyap1 = sums1_cpu[valid_mask] / counts_cpu[valid_mask] / LYAP_RENORM_INTERVAL
+                lyap2 = sums2_cpu[valid_mask] / counts_cpu[valid_mask] / LYAP_RENORM_INTERVAL
+                
+                # Mean and max of first exponent
+                mean_lyap1 = np.mean(lyap1)
+                max_lyap1 = np.max(lyap1)
+                
+                # Mean and max of second exponent
+                mean_lyap2 = np.mean(lyap2)
+                max_lyap2 = np.min(lyap2)  # use min as this is typically negative
+                
+                return (mean_lyap1, mean_lyap2), (max_lyap1, max_lyap2)
+        return (0.0, 0.0), (0.0, 0.0)
+    
+    def save_snapshot(self):
+        """Save current lyapunov spectrum to history"""
+        mean_spectrum, max_spectrum = self.get_current_exponents()
+        mean_lyap1, mean_lyap2 = mean_spectrum
+        max_lyap1, max_lyap2 = max_spectrum
+        
+        # Compute Kaplan-Yorke dimensions
+        mean_ky_dim = compute_kaplan_yorke_dim(mean_spectrum)
+        max_ky_dim = compute_kaplan_yorke_dim(max_spectrum)
+        
+        self.history.append({
+            'time': self.total_time,
+            'mean_lyap1': mean_lyap1,
+            'mean_lyap2': mean_lyap2,
+            'max_lyap1': max_lyap1,
+            'max_lyap2': max_lyap2,
+            'mean_ky_dim': mean_ky_dim,
+            'max_ky_dim': max_ky_dim,
+            'noise_range': NOISE_RANGE
+        })
+        return mean_spectrum, max_spectrum
+
     def evolve_with_lyap(self, particles_x_gpu, particles_y_gpu, noise_segments, num_steps):
         """Evolve particles while computing lyapunov exponents"""
         if self.backend == 'cuda':
@@ -519,7 +700,7 @@ class LyapunovTracker:
                     self.tangent_xx, self.tangent_xy, self.tangent_yx, self.tangent_yy,
                     noise_segments['a'], noise_segments['b'],
                     num_steps, BASE_PARAMS['a'], BASE_PARAMS['b'],
-                    self.lyap_sums, self.step_count
+                    self.lyap_sums1, self.lyap_sums2, self.step_count
                 )
             elif attractor_choice == 2:  # Clifford
                 evolve_clifford_with_lyap_kernel[NUM_BLOCKS, NUM_THREADS_PER_BLOCK](
@@ -529,37 +710,11 @@ class LyapunovTracker:
                     noise_segments['c'], noise_segments['d'],
                     num_steps, BASE_PARAMS['a'], BASE_PARAMS['b'],
                     BASE_PARAMS['c'], BASE_PARAMS['d'],
-                    self.lyap_sums, self.step_count
+                    self.lyap_sums1, self.lyap_sums2, self.step_count
                 )
             
             cp.cuda.stream.get_current_stream().synchronize()
             self.total_time += num_steps
-    
-    def get_current_exponents(self):
-        """Get current lyapunov exponents"""
-        if self.backend == 'cuda':
-            sums_cpu = cp.asnumpy(self.lyap_sums)
-            counts_cpu = cp.asnumpy(self.step_count)
-            
-            # Average across particles and normalize by time
-            valid_mask = counts_cpu > 0
-            if np.any(valid_mask):
-                avg_sum = np.mean(sums_cpu[valid_mask])
-                avg_count = np.mean(counts_cpu[valid_mask])
-                # Convert to per-iteration rate, then multiply by renorm interval
-                lyap_exp = (avg_sum / avg_count) / LYAP_RENORM_INTERVAL
-                return lyap_exp
-        return 0.0
-    
-    def save_snapshot(self):
-        """Save current lyapunov exponent to history"""
-        current_exp = self.get_current_exponents()
-        self.history.append({
-            'time': self.total_time,
-            'lyap_exp': current_exp,
-            'noise_range': NOISE_RANGE
-        })
-        return current_exp
 
 def evolve_particles_with_lyap_option(particles_x_gpu, particles_y_gpu, noise_segments, num_steps, lyap_tracker=None):
     """Enhanced evolve function that optionally computes lyapunov exponents"""
@@ -567,6 +722,26 @@ def evolve_particles_with_lyap_option(particles_x_gpu, particles_y_gpu, noise_se
         lyap_tracker.evolve_with_lyap(particles_x_gpu, particles_y_gpu, noise_segments, num_steps)
     else:
         evolve_particles(particles_x_gpu, particles_y_gpu, noise_segments, num_steps)
+
+def compute_kaplan_yorke_dim(lyap_spectrum):
+    """
+    Compute the Kaplan-Yorke (Lyapunov) dimension from a lyapunov spectrum.
+    For a 2D system, KY dim = 1 + λ1/|λ2| if λ1 + λ2 < 0 and λ1 > 0
+    where λ1 is the largest lyapunov exponent.
+    """
+    if len(lyap_spectrum) != 2:
+        return None
+    
+    lambda1, lambda2 = lyap_spectrum
+    
+    # Check conditions for KY dimension formula
+    if lambda1 + lambda2 < 0 and lambda1 > 0:
+        ky_dim = 1.0 + lambda1/abs(lambda2)
+        return min(ky_dim, 2.0)  # cap at embedding dimension
+    elif lambda1 <= 0:
+        return 1.0  # periodic/stable behavior
+    else:
+        return 2.0  # fully chaotic
 
 # --- Main Script ---
 if __name__ == "__main__":
@@ -665,7 +840,7 @@ if __name__ == "__main__":
         # Log lyapunov progress during pullback
         if lyap_tracker is not None and i % (LYAP_SAVE_INTERVAL * 10) == 0:
             current_lyap = lyap_tracker.save_snapshot()
-            print(f"Pullback {i}/{PULLBACK_STEPS} - Lyapunov exp: {current_lyap:.6f}")
+            print(f"Pullback {i}/{PULLBACK_STEPS} - Lyapunov exp: {current_lyap}")
         elif i % 1000 == 0 and i > 0:  # Don't double-print with snapshot msg
             print(f"Pullback progress: {i}/{PULLBACK_STEPS}")
     
@@ -687,7 +862,7 @@ if __name__ == "__main__":
     
     if lyap_tracker is not None:
         final_pullback_lyap = lyap_tracker.get_current_exponents()
-        print(f"Final pullback lyapunov exponent: {final_pullback_lyap:.6f}")
+        print(f"Final pullback lyapunov exponents: {final_pullback_lyap}")
     
     # --- Intermediate Phase ---
     print("Intermediate evolution phase...")
@@ -732,7 +907,7 @@ if __name__ == "__main__":
         
         if lyap_tracker is not None:
             current_lyap = lyap_tracker.save_snapshot()
-            print(f"Intermediate snapshot {len(snapshot_images) - len(PULLBACK_SNAPSHOT_STEPS)}/{INTERMEDIATE_SNAPSHOTS} - Lyapunov exp: {current_lyap:.6f}")
+            print(f"Intermediate snapshot {len(snapshot_images) - len(PULLBACK_SNAPSHOT_STEPS)}/{INTERMEDIATE_SNAPSHOTS} - Lyapunov exp: {current_lyap}")
         else:
             print(f"Intermediate snapshot {len(snapshot_images) - len(PULLBACK_SNAPSHOT_STEPS)}/{INTERMEDIATE_SNAPSHOTS}")
     
@@ -773,7 +948,7 @@ if __name__ == "__main__":
         # Save lyapunov snapshot periodically
         if lyap_tracker is not None and snap_idx % (LYAP_SAVE_INTERVAL // STEPS_PER_SNAPSHOT) == 0:
             current_lyap = lyap_tracker.save_snapshot()
-            print(f"Main snapshot {snap_idx} - Lyapunov exp: {current_lyap:.6f}")
+            print(f"Main snapshot {snap_idx} - Lyapunov exp: {current_lyap}")
         
         # Get particle positions back to CPU for histogram
         if BACKEND == 'cuda':
@@ -857,66 +1032,147 @@ if __name__ == "__main__":
         
         # Extract time series
         times = [entry['time'] for entry in lyap_tracker.history]
-        lyap_values = [entry['lyap_exp'] for entry in lyap_tracker.history]
+        mean_lyap1_values = [entry['mean_lyap1'] for entry in lyap_tracker.history]
+        mean_lyap2_values = [entry['mean_lyap2'] for entry in lyap_tracker.history]
+        max_lyap1_values = [entry['max_lyap1'] for entry in lyap_tracker.history]
+        max_lyap2_values = [entry['max_lyap2'] for entry in lyap_tracker.history]
+        mean_ky_values = [entry['mean_ky_dim'] for entry in lyap_tracker.history]
+        max_ky_values = [entry['max_ky_dim'] for entry in lyap_tracker.history]
         
-        # Statistics
-        mean_lyap = np.mean(lyap_values)
-        std_lyap = np.std(lyap_values)
-        min_lyap = np.min(lyap_values)
-        max_lyap = np.max(lyap_values)
+        # Filter out infinities and nans for plotting
+        def clean_data(data):
+            return np.array([x for x in data if np.isfinite(x)])
         
-        print(f"Mean lyapunov exponent: {mean_lyap:.6f}")
-        print(f"Standard deviation: {std_lyap:.6f}")
-        print(f"Range: [{min_lyap:.6f}, {max_lyap:.6f}]")
-        print(f"Noise range: {NOISE_RANGE}")
+        mean_lyap1_clean = clean_data(mean_lyap1_values)
+        mean_lyap2_clean = clean_data(mean_lyap2_values)
+        max_lyap1_clean = clean_data(max_lyap1_values)
+        max_lyap2_clean = clean_data(max_lyap2_values)
         
-        # Stability analysis
-        if mean_lyap > 0.01:
-            print("DIAGNOSIS: Strong chaotic behavior (positive lyapunov exp)")
-        elif mean_lyap > -0.01:
-            print("DIAGNOSIS: Near-neutral stability (lyapunov exp ≈ 0)")
-        else:
-            print("DIAGNOSIS: Stable/periodic behavior (negative lyapunov exp)")
+        # Recompute statistics with clean data
+        mean_of_means1 = np.mean(mean_lyap1_clean)
+        std_of_means1 = np.std(mean_lyap1_clean)
+        mean_of_means2 = np.mean(mean_lyap2_clean)
+        std_of_means2 = np.std(mean_lyap2_clean)
         
-        # Save lyapunov data
-        lyap_filename = os.path.join(RUN_DIR, f"lyapunov_{ATTRACTOR_NAME.lower()}_{TIMESTAMP}.txt")
-        with open(lyap_filename, 'w') as f:
-            f.write(f"# Lyapunov exponent analysis for {ATTRACTOR_NAME} attractor\n")
-            f.write(f"# Noise range: {NOISE_RANGE}\n")
-            f.write(f"# Mean: {mean_lyap:.6f}, Std: {std_lyap:.6f}\n")
-            f.write("# Time\tLyapunov_Exp\n")
-            for time_val, lyap_val in zip(times, lyap_values):
-                f.write(f"{time_val}\t{lyap_val:.8f}\n")
-        
-        print(f"Saved lyapunov data to {lyap_filename}")
-        
-        # Create lyapunov plot
-        fig_lyap, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        mean_of_maxs1 = np.mean(max_lyap1_clean)
+        std_of_maxs1 = np.std(max_lyap1_clean)
+        mean_of_maxs2 = np.mean(max_lyap2_clean)
+        std_of_maxs2 = np.std(max_lyap2_clean)
+
+        # Create enhanced visualization with 4 subplots
         plt.style.use('dark_background')
+        fig_lyap, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
         
-        # Time series plot
-        ax1.plot(times, lyap_values, 'cyan', linewidth=1.5, alpha=0.8)
-        ax1.axhline(y=0, color='red', linestyle='--', alpha=0.7, label='Neutral stability')
+        # Time series plot - both lyapunov exponents
+        ax1.plot(times, mean_lyap1_clean, 'cyan', linewidth=1.5, alpha=0.8, label='Mean L1')
+        ax1.plot(times, mean_lyap2_clean, 'magenta', linewidth=1.5, alpha=0.8, label='Mean L2')
+        ax1.plot(times, max_lyap1_clean, 'orange', linewidth=1.5, alpha=0.8, label='Max L1')
+        ax1.plot(times, max_lyap2_clean, 'red', linewidth=1.5, alpha=0.8, label='Max L2')
+        ax1.axhline(y=0, color='yellow', linestyle='--', alpha=0.7, label='Neutral')
         ax1.set_xlabel('Time Steps')
-        ax1.set_ylabel('Lyapunov Exponent')
-        ax1.set_title(f'{ATTRACTOR_NAME} Attractor - Lyapunov Exponent Evolution')
+        ax1.set_ylabel('Lyapunov Exponents')
+        ax1.set_title(f'{ATTRACTOR_NAME} Attractor - Lyapunov Spectrum Evolution')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
         
-        # Histogram
-        ax2.hist(lyap_values, bins=30, color='cyan', alpha=0.7, edgecolor='white')
-        ax2.axvline(x=mean_lyap, color='red', linestyle='-', linewidth=2, label=f'Mean: {mean_lyap:.4f}')
-        ax2.axvline(x=0, color='yellow', linestyle='--', alpha=0.7, label='Neutral')
-        ax2.set_xlabel('Lyapunov Exponent')
-        ax2.set_ylabel('Frequency')
-        ax2.set_title('Lyapunov Exponent Distribution')
+        # Kaplan-Yorke dimension time series
+        valid_mean_ky = [x for x in mean_ky_values if x is not None and np.isfinite(x)]
+        valid_max_ky = [x for x in max_ky_values if x is not None and np.isfinite(x)]
+        ax2.plot(times[:len(valid_mean_ky)], valid_mean_ky, 'cyan', linewidth=1.5, alpha=0.8, label='Mean KY')
+        ax2.plot(times[:len(valid_max_ky)], valid_max_ky, 'orange', linewidth=1.5, alpha=0.8, label='Max KY')
+        ax2.axhline(y=1.0, color='yellow', linestyle='--', alpha=0.7, label='D=1')
+        ax2.axhline(y=2.0, color='red', linestyle='--', alpha=0.7, label='D=2')
+        ax2.set_xlabel('Time Steps')
+        ax2.set_ylabel('Kaplan-Yorke Dimension')
+        ax2.set_title('Kaplan-Yorke Dimension Evolution')
+        ax2.grid(True, alpha=0.3)
         ax2.legend()
+        
+        # Histogram for mean lyapunov spectrum
+        ax3.hist(mean_lyap1_clean, bins=30, color='cyan', alpha=0.5, label='Mean L1')
+        ax3.hist(mean_lyap2_clean, bins=30, color='magenta', alpha=0.5, label='Mean L2')
+        ax3.axvline(x=mean_of_means1, color='cyan', linestyle='-', linewidth=2)
+        ax3.axvline(x=mean_of_means2, color='magenta', linestyle='-', linewidth=2)
+        ax3.axvline(x=0, color='yellow', linestyle='--', alpha=0.7, label='Neutral')
+        ax3.set_xlabel('Lyapunov Exponents')
+        ax3.set_ylabel('Frequency')
+        ax3.set_title('Mean Lyapunov Spectrum Distribution')
+        ax3.legend()
+        
+        # Histogram for Kaplan-Yorke dimension
+        ax4.hist(valid_mean_ky, bins=30, color='cyan', alpha=0.5, label='Mean KY')
+        ax4.hist(valid_max_ky, bins=30, color='orange', alpha=0.5, label='Max KY')
+        if valid_mean_ky:
+            ax4.axvline(x=np.mean(valid_mean_ky), color='cyan', linestyle='-', linewidth=2)
+        if valid_max_ky:
+            ax4.axvline(x=np.mean(valid_max_ky), color='orange', linestyle='-', linewidth=2)
+        ax4.set_xlabel('Kaplan-Yorke Dimension')
+        ax4.set_ylabel('Frequency')
+        ax4.set_title('Kaplan-Yorke Dimension Distribution')
+        ax4.legend()
         
         plt.tight_layout()
         lyap_plot_filename = os.path.join(RUN_DIR, f"lyapunov_analysis_{ATTRACTOR_NAME.lower()}_{TIMESTAMP}.png")
         plt.savefig(lyap_plot_filename, dpi=150, bbox_inches='tight')
         print(f"Saved lyapunov analysis plot to {lyap_plot_filename}")
         
+        # Print statistics with clean data
+        print(f"Mean lyapunov spectrum: L1={mean_of_means1:.6f}±{std_of_means1:.6f}, L2={mean_of_means2:.6f}±{std_of_means2:.6f}")
+        print(f"Max lyapunov spectrum: L1={mean_of_maxs1:.6f}±{std_of_maxs1:.6f}, L2={mean_of_maxs2:.6f}±{std_of_maxs2:.6f}")
+        
+        mean_ky = np.mean(valid_mean_ky) if valid_mean_ky else float('nan')
+        max_ky = np.mean(valid_max_ky) if valid_max_ky else float('nan')
+        print(f"Mean Kaplan-Yorke dimension: {mean_ky:.6f}")
+        print(f"Max Kaplan-Yorke dimension: {max_ky:.6f}")
+        
+        # Print noise configuration
+        noise_config = config['noise']
+        if noise_config['type'] == NoiseType.GAUSSIAN:
+            print(f"Noise type: Gaussian (μ={noise_config['params']['mean']}, σ={noise_config['params']['std']})")
+        elif noise_config['type'] == NoiseType.UNIFORM:
+            print(f"Noise type: Uniform [{noise_config['params']['low']}, {noise_config['params']['high']}]")
+        else:
+            print("Noise type: None")
+
+        # Stability analysis based on maximal lyapunov (more standard)
+        if mean_of_maxs1 > 0.01:
+            print("DIAGNOSIS: Strong chaotic behavior (positive maximal lyapunov exp)")
+        elif mean_of_maxs1 > -0.01:
+            print("DIAGNOSIS: Near-neutral stability (maximal lyapunov exp ≈ 0)")
+        else:
+            print("DIAGNOSIS: Stable/periodic behavior (negative maximal lyapunov exp)")
+        
+        # Save lyapunov data with clean values
+        lyap_filename = os.path.join(RUN_DIR, f"lyapunov_{ATTRACTOR_NAME.lower()}_{TIMESTAMP}.txt")
+        with open(lyap_filename, 'w', encoding='utf-8') as f:
+            f.write(f"# Lyapunov exponent analysis for {ATTRACTOR_NAME} attractor\n")
+            
+            # Write noise configuration
+            if noise_config['type'] == NoiseType.GAUSSIAN:
+                f.write(f"# Noise: Gaussian (mean={noise_config['params']['mean']}, std={noise_config['params']['std']})\n")
+            elif noise_config['type'] == NoiseType.UNIFORM:
+                f.write(f"# Noise: Uniform [{noise_config['params']['low']}, {noise_config['params']['high']}]\n")
+            else:
+                f.write("# Noise: None\n")
+            
+            f.write(f"# Mean lyapunov spectrum: L1={mean_of_means1:.6f}±{std_of_means1:.6f}, L2={mean_of_means2:.6f}±{std_of_means2:.6f}\n")
+            f.write(f"# Max lyapunov spectrum: L1={mean_of_maxs1:.6f}±{std_of_maxs1:.6f}, L2={mean_of_maxs2:.6f}±{std_of_maxs2:.6f}\n")
+            f.write("# Time\tMean_L1\tMean_L2\tMax_L1\tMax_L2\tMean_KY\tMax_KY\n")
+            
+            # Write only finite values
+            for t, ml1, ml2, mxl1, mxl2, mky, mxky in zip(times, 
+                                                          mean_lyap1_values, mean_lyap2_values,
+                                                          max_lyap1_values, max_lyap2_values,
+                                                          mean_ky_values, max_ky_values):
+                # Replace inf/nan with string representation
+                def fmt(x):
+                    if x is None or not np.isfinite(x):
+                        return "nan"
+                    return f"{x:.8f}"
+                
+                f.write(f"{t}\t{fmt(ml1)}\t{fmt(ml2)}\t{fmt(mxl1)}\t{fmt(mxl2)}\t{fmt(mky)}\t{fmt(mxky)}\n")
+        
+        print(f"Saved lyapunov data to {lyap_filename}")
         plt.show()
     else:
         plt.show()
