@@ -1,75 +1,75 @@
-# Morphing Stochastic Attractors
+# Strange Attractors
 
-GPU-accelerated visualization of chaotic attractors evolving under parameter noise, with real-time lyapunov exponent tracking.
+A high-performance CUDA-accelerated simulation framework for studying stochastic strange attractors.
 
 ## Features
 
-- **3 Attractors**: Hénon, Clifford, Ikeda maps with stochastic perturbations
-- **GPU Acceleration**: CUDA (Windows) / JAX Metal (Mac) backends
-- **Lyapunov Tracking**: Real-time stability analysis (Hénon/Clifford)
-- **Formation Dynamics**: See attractors emerge from random scatter
+- Multiple attractor maps (Hénon, Clifford, Ikeda)
+- Stochastic parameter evolution with configurable noise
+- Lyapunov exponent tracking and analysis
+- Visualization tools for attractor morphing
+- CUDA GPU acceleration
 
-## Installation
-
-**Windows (NVIDIA):**
-
-```bash
-pip install cupy numba matplotlib pillow numpy
-```
-
-**macOS (Apple Silicon):**
+## Install dependencies:
 
 ```bash
-pip install jax[metal] matplotlib pillow numpy
+pip install -r requirements.txt
 ```
+
+Note: Requires NVIDIA GPU with CUDA support and compatible drivers.
 
 ## Usage
 
+Basic usage with default parameters:
+
 ```bash
-python stochastic_attractors.py
+python -m src.main
+# defaults: --num-blocks 2048, --threads-per-block 256 → num-particles=524288
 ```
 
-Choose attractor (1-3) → watch formation → get lyapunov analysis
+Full options:
+
+```bash
+python -m src.main --attractor [henon|clifford|ikeda] \
+                   --num-particles 10000 \
+                   --num-steps 1000 \
+                   --lyap-particles 1000 \
+                   --num-blocks 2048 \
+                   --threads-per-block 256 \
+                   --output-dir results \
+                   --save-animation \
+                   --save-lyapunov
+```
+
+The program will interactively prompt for noise configuration:
+
+1. Choose noise type (uniform/gaussian/none)
+2. Enter noise parameters (bounds or mean/std)
 
 ## Output
 
-Each run creates: `results/TIMESTAMP_attractor/`
+- Attractor evolution animations (GIF) saved to `results/<timestamp>_<attractor>_attractor/`
+- Lyapunov spectrum analysis plots saved to `results/<timestamp>_<attractor>_attractor/`
+- Raw data files for further analysis saved to `results/<timestamp>_<attractor>_attractor/`
 
-- `morphing_[attractor].gif` - Animation
-- `lyapunov_[attractor]_[time].txt` - Time series data
-- `lyapunov_analysis_[attractor]_[time].png` - Analysis plots
+## Examples
 
-## Configuration
+Hénon map with uniform noise:
 
-Key parameters in `ATTRACTORS` dict:
-
-- `noise_range` - Perturbation amplitude
-- `bounds` - Viewing window
-- `params` - Base parameter values
-
-Simulation settings:
-
-```python
-LYAP_COMPUTATION = True    # Enable lyapunov tracking
-LYAP_TRACK_PARTICLES = 100 # Particles for lyap computation
-NUM_SNAPSHOTS = 120        # Animation length
+```bash
+python -m src.main --attractor henon --save-animation --save-lyapunov
+# Choose: 1 (uniform noise)
+# Enter: -0.1, 0.1 (noise bounds)
 ```
 
-## Lyapunov Features
+Clifford attractor with Gaussian noise:
 
-**Supported:** Hénon (full theory), Clifford (jacobian-based)
+```bash
+python -m src.main --attractor clifford --save-animation
+# Choose: 2 (gaussian noise)
+# Enter: 0.0, 0.05 (mean, std)
+```
 
-**Analysis:**
+## License
 
-- Real-time exponent monitoring
-- Stability classification (chaotic/periodic/fixed point)
-- Time series plots and statistics
-
-**Theory Note:** For Hénon with uniform noise: λ₁ + λ₂ = 𝔼[ln|b_k|]
-
-## Troubleshooting
-
-- **No GPU**: Install CUDA toolkit (Windows) or JAX Metal (Mac)
-- **Empty frames**: Reduce `noise_range` or increase `bounds`
-- **Performance**: Lower `NUM_BLOCKS` or disable lyapunov
-- **Lyap errors**: Adjust `LYAP_RENORM_INTERVAL` (5-20)
+MIT

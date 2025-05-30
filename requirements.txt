@@ -1,0 +1,5 @@
+numpy>=1.21.0
+matplotlib>=3.4.0
+cupy-cuda11x>=11.0.0  # adjust cuda version as needed
+numba>=0.54.0
+pillow>=8.3.0  # for GIF animation 
