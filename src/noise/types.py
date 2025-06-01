@@ -99,9 +99,5 @@ ATTRACTOR_NOISE_CONFIGS = {
     'clifford': NoiseConfig(
         type=NoiseType.UNIFORM,
         params={'low': -0.15, 'high': 0.15}
-    ),
-    'ikeda': NoiseConfig(
-        type=NoiseType.GAUSSIAN,
-        params={'mean': 0.0, 'std': 0.01}
     )
 } 

@@ -1,7 +1,7 @@
 """
-CUDA compute backend
+CUDA computation backend
 """
 
-from .cuda_backend import CUDABackend, CUDAKernels
+from compute.cuda_backend import CUDABackend, CUDAKernels
 
 __all__ = ['CUDABackend', 'CUDAKernels'] 

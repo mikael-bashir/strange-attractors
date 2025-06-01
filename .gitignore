@@ -28,6 +28,7 @@ wheels/
 MANIFEST
 
 
+regime_analysis_results_*
 results/
 output/
 noise_sweep_results/

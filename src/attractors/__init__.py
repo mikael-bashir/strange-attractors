@@ -1,16 +1,15 @@
 """
-Strange attractor implementations
+Attractor implementations and registry
 """
 
 from .base import Attractor, AttractorConfig
 from .henon import HenonMap
 from .clifford import CliffordMap
-from .ikeda import IkedaMap
 
+# available attractors registry
 AVAILABLE_ATTRACTORS = {
     'henon': HenonMap,
-    'clifford': CliffordMap,
-    'ikeda': IkedaMap
+    'clifford': CliffordMap
 }
 
-__all__ = ['Attractor', 'AttractorConfig', 'HenonMap', 'CliffordMap', 'IkedaMap', 'AVAILABLE_ATTRACTORS'] 
+__all__ = ['Attractor', 'AttractorConfig', 'HenonMap', 'CliffordMap', 'AVAILABLE_ATTRACTORS'] 

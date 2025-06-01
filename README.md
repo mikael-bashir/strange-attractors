@@ -4,71 +4,73 @@ A high-performance CUDA-accelerated simulation framework for studying stochastic
 
 ## Features
 
-- Multiple attractor maps (Hénon, Clifford, Ikeda)
-- Stochastic parameter evolution with configurable noise
-- Lyapunov exponent tracking and analysis
-- Visualization tools for attractor morphing
-- CUDA GPU acceleration
+- Henon & Clifford maps
+- Uniform noise by default
+- Regime analysis via deterministic & confidence intervals
+- Noise-range sweep & phase diagram
+- Precise critical-noise boundary detection
+- Kaplan-Yorke dimension tracking
+- Attractor visualization & animation
 
-## Install dependencies:
+## Install
 
-```bash
+```
 pip install -r requirements.txt
 ```
 
-Note: Requires NVIDIA GPU with CUDA support and compatible drivers.
-
 ## Usage
 
-Basic usage with default parameters:
-
 ```bash
-python -m src.main
-# defaults: --num-blocks 2048, --threads-per-block 256 → num-particles=524288
+# cd into src first
+# single-point regime analysis
+python -m main regime -a henon -n 0.001 -p 10000 -o results
+
+# noise sweep
+python -m main sweep -a henon -r 0.0001 0.01 -n 20 -o sweeps
+
+# find critical boundary
+python -m main find-critical -a henon -r 0.001 0.1 -e 1e-5 -v -o critical
+
+# visualization
+python -m main visualize -a henon -n 0.001 -p 10000 -o figures  # both animation & analysis
+python -m main visualize -a henon -n 0.001 --animation-only     # just the animation
+python -m main visualize -a henon -n 0.001 --analysis-only      # just analysis plots
 ```
 
-Full options:
+## Common Options
 
-```bash
-python -m src.main --attractor [henon|clifford|ikeda] \
-                   --num-particles 10000 \
-                   --num-steps 1000 \
-                   --lyap-particles 1000 \
-                   --num-blocks 2048 \
-                   --threads-per-block 256 \
-                   --output-dir results \
-                   --save-animation \
-                   --save-lyapunov
 ```
-
-The program will interactively prompt for noise configuration:
-
-1. Choose noise type (uniform/gaussian/none)
-2. Enter noise parameters (bounds or mean/std)
+-a, --attractor      attractor type (henon, clifford)
+-n, --noise         noise amplitude
+-p, --params        custom attractor parameters (JSON)
+-t, --trajectories  number of trajectories
+-P, --particles     particles per trajectory
+-L, --lyap          particles for lyapunov tracking
+-o, --output        output directory
+-s, --save-data     save detailed trajectory data
+```
 
 ## Output
 
-- Attractor evolution animations (GIF) saved to `results/<timestamp>_<attractor>_attractor/`
-- Lyapunov spectrum analysis plots saved to `results/<timestamp>_<attractor>_attractor/`
-- Raw data files for further analysis saved to `results/<timestamp>_<attractor>_attractor/`
+Each command writes results to `<output-dir>_<timestamp>/`:
 
-## Examples
+### Regime Analysis
 
-Hénon map with uniform noise:
+- `regime_analysis.json`: classification & confidence intervals
 
-```bash
-python -m src.main --attractor henon --save-animation --save-lyapunov
-# Choose: 1 (uniform noise)
-# Enter: -0.1, 0.1 (noise bounds)
-```
+### Noise Sweep
 
-Clifford attractor with Gaussian noise:
+- `noise_sweep_results.json`: phase diagram & transitions
 
-```bash
-python -m src.main --attractor clifford --save-animation
-# Choose: 2 (gaussian noise)
-# Enter: 0.0, 0.05 (mean, std)
-```
+### Critical Boundary
+
+- `critical_noise.json`: precise boundary location
+
+### Visualization
+
+- `morphing_<attractor>.gif`: attractor evolution animation
+- `lyapunov_analysis_<attractor>.png`: analysis plots
+- `lyapunov_<attractor>.txt`: numerical data (with -s flag)
 
 ## License
 
